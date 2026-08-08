@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "X Tweet Region Filter (Mexico States)",
+  "version": "0.2.0",
+  "description": "Filtra y bloquea tweets que no pertenecen al estado mexicano seleccionado.",
+  "permissions": ["storage", "scripting", "activeTab"],
+  "host_permissions": [
+    "*://*.twitter.com/*",
+    "*://*.x.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Seleccionar estado"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.twitter.com/*", "*://*.x.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": {
+    "page": "popup.html",
+    "open_in_tab": false
+  }
+}
