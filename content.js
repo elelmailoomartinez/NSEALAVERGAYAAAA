@@ -5,6 +5,7 @@
 // - Extracts tweet IDs from status links to map tweets to metadata
 // - Adds more selectors and heuristics for location text inside tweets/profile
 // - Reduces false positives by preferring structured place metadata when available
+// - Adds aliases and city->state mapping to handle abbreviated and variant location strings
 
 (function() {
   const STATES = [
@@ -13,9 +14,69 @@
 
   function normalize(s){
     if(!s) return '';
-    return String(s).normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
+    // remove diacritics and lower-case
+    let out = String(s).normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
+    // collapse whitespace
+    out = out.replace(/\s+/g, ' ').trim();
+    return out;
   }
   const normalizedStates = STATES.map(s=>normalize(s));
+
+  // alias map: normalized key -> canonical state as in STATES
+  const STATE_ALIASES = {
+    'cdmx':'Ciudad de México',
+    'ciudad de mexico':'Ciudad de México',
+    'ciudad de méxico':'Ciudad de México',
+    'mexico df':'Ciudad de México',
+    'df':'Ciudad de México',
+    'edo de mexico':'Estado de México',
+    'edomex':'Estado de México',
+    'estado mexico':'Estado de México',
+    'estado de mexico':'Estado de México',
+    'mexico':'Estado de México', // caution: ambiguous (country vs state)
+    'nuevo leon':'Nuevo León',
+    'nl':'Nuevo León',
+    'n.l':'Nuevo León',
+    'n.l.':'Nuevo León',
+    'nuevo león':'Nuevo León',
+    'nayarit':'Nayarit'
+    // add more as needed
+  };
+
+  // common city -> state map (normalized city -> canonical state)
+  const CITY_TO_STATE = {
+    'monterrey': 'Nuevo León',
+    'guadalajara': 'Jalisco',
+    'zapopan': 'Jalisco',
+    'tuxtla gutierrez': 'Chiapas',
+    'tuxtla gutiérrez': 'Chiapas',
+    'tijuana': 'Baja California',
+    'mexico city': 'Ciudad de México',
+    'cdmx': 'Ciudad de México',
+    'ciudad de mexico': 'Ciudad de México',
+    'puebla': 'Puebla',
+    'leon': 'Guanajuato',
+    'león': 'Guanajuato',
+    'queretaro': 'Querétaro',
+    'querétaro': 'Querétaro',
+    'merida': 'Yucatán',
+    'mé rida': 'Yucatán',
+    'mérida': 'Yucatán',
+    'cancun': 'Quintana Roo',
+    'cancún': 'Quintana Roo',
+    'veracruz': 'Veracruz',
+    'villahermosa': 'Tabasco',
+    'oaxaca': 'Oaxaca',
+    'morelia': 'Michoacán',
+    'toluca': 'Estado de México',
+    'celaya': 'Guanajuato',
+    'cuernavaca': 'Morelos',
+    'saltillo': 'Coahuila',
+    'chihuahua': 'Chihuahua',
+    'culiacan': 'Sinaloa',
+    'culiacan': 'Sinaloa',
+    'mazatlan': 'Sinaloa'
+  };
 
   // In-memory maps populated by network interception
   const tweetLocationMap = {}; // tweetId -> place text or location string
@@ -34,14 +95,47 @@
     });
   }
 
-  function matchStateInText(text){
+  function canonicalStateFromText(text){
     if(!text) return null;
-    const n = normalize(text);
-    for(let i=0;i<normalizedStates.length;i++){
-      const st = normalizedStates[i].replace('estado de ', '').replace('estado ', '').replace('cdmx','ciudad de mexico').trim();
-      if(n.includes(st)) return STATES[i];
+    const nraw = normalize(text);
+    // remove punctuation that may appear in abbreviations like N.L. or N. L.
+    const n = nraw.replace(/[\.\-\_\(\)\[\]\/]/g, '').replace(/\s+/g,' ').trim();
+
+    // check aliases first (exact inclusion)
+    for(const key in STATE_ALIASES){
+      if(key && n.indexOf(key) !== -1){
+        return STATE_ALIASES[key];
+      }
     }
+
+    // check comma-separated place like "Monterrey, Nuevo León" -> take last token
+    if(n.indexOf(',')!==-1){
+      const parts = n.split(',').map(p=>p.trim()).filter(Boolean);
+      if(parts.length){
+        const last = parts[parts.length-1];
+        // try alias or state match
+        for(const key in STATE_ALIASES){ if(last.indexOf(key)!==-1) return STATE_ALIASES[key]; }
+        for(let i=0;i<normalizedStates.length;i++){ if(last.indexOf(normalizedStates[i].replace('estado de ', '').replace('estado ', ''))!==-1) return STATES[i]; }
+      }
+    }
+
+    // check city -> state map
+    for(const city in CITY_TO_STATE){
+      if(n.indexOf(city)!==-1) return CITY_TO_STATE[city];
+    }
+
+    // finally check state names by word boundary
+    for(let i=0;i<normalizedStates.length;i++){
+      const key = normalizedStates[i].replace('estado de ', '').replace('estado ', '').trim();
+      const re = new RegExp('\\b'+escapeRegExp(key)+'\\b','i');
+      if(re.test(n)) return STATES[i];
+    }
+
     return null;
+  }
+
+  function escapeRegExp(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
   // Attempt to extract tweet id from an element (status link) or data attributes
@@ -110,7 +204,7 @@
       }
 
       for(const t of textCandidates){
-        const st = matchStateInText(t);
+        const st = canonicalStateFromText(t);
         if(st) return st;
       }
       return null;
@@ -155,12 +249,17 @@
       const structured = getStructuredLocationForTweet(tweetEl);
       if(selectedState && selectedState !== 'Todos'){
         if(structured){
-          const st = matchStateInText(structured);
+          const st = canonicalStateFromText(structured);
           if(!st){
-            // structured exists but doesn't match; fallback to DOM detection as secondary check
+            // structured exists but doesn't match canonical names exactly; fallback to DOM detection as secondary check
             const domSt = detectStateForTweetByDOM(tweetEl);
             if(!domSt){
-              censorTweet(tweetEl, `Metadata detectada: ${structured}`);
+              // only censor if structured explicitly contradicts the selected state (e.g., mentions a different state explicitly)
+              const structuredNorm = normalize(structured);
+              const selNorm = normalize(selectedState);
+              if(structuredNorm.indexOf(selNorm) === -1 && selNorm.indexOf(structuredNorm) === -1){
+                censorTweet(tweetEl, `Metadata detectada (no coincide): ${structured}`);
+              }
             } else {
               if(normalize(domSt).indexOf(normalize(selectedState)) === -1 && normalize(selectedState).indexOf(normalize(domSt)) === -1){
                 censorTweet(tweetEl, `Metadata detectada: ${structured}; DOM detectada: ${domSt}`);
@@ -180,7 +279,7 @@
             let username = null;
             try{
               const profileLink = tweetEl.querySelector('a[href^="/"]');
-              if(profileLink && profileLink.href){
+              if(profileLink && profileLink.getAttribute('href')){
                 const m = profileLink.getAttribute('href').match(/^\/(?!home)([^/]+)\/?$/);
                 if(m && m[1]) username = m[1];
               }
@@ -188,7 +287,7 @@
 
             const userLoc = username && userLocationMap[username] ? userLocationMap[username] : null;
             if(userLoc){
-              const stU = matchStateInText(userLoc);
+              const stU = canonicalStateFromText(userLoc);
               if(!stU){
                 censorTweet(tweetEl, 'Sin ubicación detectada');
               } else {
@@ -198,7 +297,8 @@
               }
             } else {
               // no info at all
-              censorTweet(tweetEl, 'Sin metadata de ubicación detectada');
+              // make less aggressive: do not censor if no detection at all (reduce false positives)
+              // censorTweet(tweetEl, 'Sin metadata de ubicación detectada');
             }
           } else {
             if(normalize(domSt).indexOf(normalize(selectedState)) === -1 && normalize(selectedState).indexOf(normalize(domSt)) === -1){
